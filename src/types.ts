@@ -1,62 +1,69 @@
-export interface AdditionalMount {
-  hostPath: string; // Absolute path on host (supports ~ for home)
-  containerPath?: string; // Optional — defaults to basename of hostPath. Mounted at /workspace/extra/{value}
-  readonly?: boolean; // Default: true for safety
+export type ChannelId = string;
+export type AccountId = string;
+export type ConversationId = string;
+
+export type ConversationPeerKind = 'group' | 'user' | 'system' | 'legacy';
+
+export interface ConversationRef {
+  channel: ChannelId;
+  externalId: string;
+  peerKind: ConversationPeerKind;
+  accountId?: AccountId;
 }
 
-/**
- * Mount Allowlist - Security configuration for additional mounts
- * This file should be stored at ~/.config/nanoclaw/mount-allowlist.json
- * and is NOT mounted into any container, making it tamper-proof from agents.
- */
-export interface MountAllowlist {
-  // Directories that can be mounted into containers
-  allowedRoots: AllowedRoot[];
-  // Glob patterns for paths that should never be mounted (e.g., ".ssh", ".gnupg")
-  blockedPatterns: string[];
-  // If true, non-main groups can only mount read-only regardless of config
-  nonMainReadOnly: boolean;
+export interface ConversationRecord extends ConversationRef {
+  id: ConversationId;
+  legacyChatJid?: string;
+  displayName: string;
+  isGroup: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export interface AllowedRoot {
-  // Absolute path or ~ for home (e.g., "~/projects", "/var/repos")
-  path: string;
-  // Whether read-write mounts are allowed under this root
-  allowReadWrite: boolean;
-  // Optional description for documentation
-  description?: string;
+export interface MessageTarget {
+  conversationId: ConversationId;
+  chatJid: string;
+  channel: ChannelId;
+  externalId: string;
+  peerKind: ConversationPeerKind;
+  accountId?: AccountId;
+  isGroup: boolean;
 }
 
-export interface ContainerConfig {
-  additionalMounts?: AdditionalMount[];
-  timeout?: number; // Default: 300000 (5 minutes)
-}
-
-export interface RegisteredGroup {
+export interface RegisteredConversation {
   name: string;
   folder: string;
   trigger: string;
   added_at: string;
-  containerConfig?: ContainerConfig;
-  requiresTrigger?: boolean; // Default: true for groups, false for solo chats
-  isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  requiresTrigger?: boolean;
+  isMain?: boolean;
+  conversationId?: ConversationId;
 }
+
+/** @deprecated 使用 RegisteredConversation */
+export type RegisteredGroup = RegisteredConversation;
 
 export interface NewMessage {
   id: string;
   chat_jid: string;
+  conversation_id?: ConversationId;
   sender: string;
   sender_name: string;
   content: string;
   timestamp: string;
+  message_type?: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  mentioned_bot?: boolean;
+  trigger_matched?: boolean;
+  trigger_source?: 'mention' | 'text' | 'system' | 'none';
 }
 
 export interface ScheduledTask {
   id: string;
   group_folder: string;
   chat_jid: string;
+  conversation_id?: ConversationId;
   prompt: string;
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
@@ -68,26 +75,20 @@ export interface ScheduledTask {
   created_at: string;
 }
 
-export interface TaskRunLog {
-  task_id: string;
-  run_at: string;
-  duration_ms: number;
-  status: 'success' | 'error';
-  result: string | null;
-  error: string | null;
-}
-
 // --- Channel abstraction ---
 
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(target: MessageTarget, text: string): Promise<void>;
   isConnected(): boolean;
-  ownsJid(jid: string): boolean;
+  ownsTarget(target: MessageTarget): boolean;
   disconnect(): Promise<void>;
+  normalizeTarget?(target: string): string | undefined;
+  resolveTarget?(target: string, conversationId?: ConversationId): MessageTarget | null;
+  getTargetFormats?(): string[];
   // Optional: typing indicator. Channels that support it implement it.
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  setTyping?(target: MessageTarget, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

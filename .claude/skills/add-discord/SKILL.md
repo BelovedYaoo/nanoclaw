@@ -97,14 +97,6 @@ DISCORD_BOT_TOKEN=<their-token>
 
 Channels auto-enable when their credentials are present — no extra configuration needed.
 
-Sync to container environment:
-
-```bash
-mkdir -p data/env && cp .env data/env/env
-```
-
-The container reads environment from `data/env/env`, not `.env` directly.
-
 ### Build and restart
 
 ```bash

@@ -4,16 +4,18 @@ import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
-import { AvailableGroup } from './container-runner.js';
+import { AvailableGroup } from './agent-runtime.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { wakeScheduler } from './task-scheduler.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { ConversationId, MessageTarget, RegisteredConversation } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
-  registeredGroups: () => Record<string, RegisteredGroup>;
-  registerGroup: (jid: string, group: RegisteredGroup) => void;
+  resolveTarget: (target: string, conversationId?: ConversationId) => MessageTarget;
+  sendMessage: (target: MessageTarget, text: string) => Promise<void>;
+  registeredGroups: () => Record<string, RegisteredConversation>;
+  registerGroup: (jid: string, group: RegisteredConversation) => void;
   syncGroups: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
@@ -74,15 +76,25 @@ export function startIpcWatcher(deps: IpcDeps): void {
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
+                // Authorization: verify this group can send to this target
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  const target = deps.resolveTarget(
+                    data.chatJid,
+                    typeof data.conversationId === 'string'
+                      ? data.conversationId
+                      : targetGroup?.conversationId,
+                  );
+                  await deps.sendMessage(target, data.text);
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    {
+                      chatJid: target.chatJid,
+                      conversationId: target.conversationId,
+                      sourceGroup,
+                    },
                     'IPC message sent',
                   );
                 } else {
@@ -163,14 +175,15 @@ export async function processTaskIpc(
     context_mode?: string;
     groupFolder?: string;
     chatJid?: string;
+    conversationId?: string;
     targetJid?: string;
+    targetConversationId?: string;
     // For register_group
     jid?: string;
     name?: string;
     folder?: string;
     trigger?: string;
     requiresTrigger?: boolean;
-    containerConfig?: RegisteredGroup['containerConfig'];
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -254,10 +267,22 @@ export async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
+        const targetConversationId =
+          typeof data.targetConversationId === 'string'
+            ? data.targetConversationId
+            : targetGroupEntry.conversationId;
+        if (!targetConversationId) {
+          logger.warn(
+            { targetJid },
+            'Cannot schedule task: target conversation id is missing',
+          );
+          break;
+        }
         createTask({
           id: taskId,
           group_folder: targetFolder,
           chat_jid: targetJid,
+          conversation_id: targetConversationId,
           prompt: data.prompt,
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
@@ -270,6 +295,7 @@ export async function processTaskIpc(
           { taskId, sourceGroup, targetFolder, contextMode },
           'Task created via IPC',
         );
+        wakeScheduler();
       }
       break;
 
@@ -282,6 +308,7 @@ export async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
           );
+          wakeScheduler();
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
@@ -300,6 +327,7 @@ export async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
           );
+          wakeScheduler();
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
@@ -318,6 +346,7 @@ export async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
           );
+          wakeScheduler();
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
@@ -388,6 +417,7 @@ export async function processTaskIpc(
           { taskId: data.taskId, sourceGroup, updates },
           'Task updated via IPC',
         );
+        wakeScheduler();
       }
       break;
 
@@ -438,7 +468,6 @@ export async function processTaskIpc(
           folder: data.folder,
           trigger: data.trigger,
           added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
         });
       } else {

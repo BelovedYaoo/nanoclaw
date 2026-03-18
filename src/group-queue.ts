@@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { DATA_DIR, MAX_CONCURRENT_AGENTS } from './config.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -22,7 +22,7 @@ interface GroupState {
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
-  containerName: string | null;
+  processName: string | null;
   groupFolder: string | null;
   retryCount: number;
 }
@@ -46,7 +46,7 @@ export class GroupQueue {
         pendingMessages: false,
         pendingTasks: [],
         process: null,
-        containerName: null,
+        processName: null,
         groupFolder: null,
         retryCount: 0,
       };
@@ -66,11 +66,11 @@ export class GroupQueue {
 
     if (state.active) {
       state.pendingMessages = true;
-      logger.debug({ groupJid }, 'Container active, message queued');
+      logger.debug({ groupJid }, 'Host agent active, message queued');
       return;
     }
 
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+    if (this.activeCount >= MAX_CONCURRENT_AGENTS) {
       state.pendingMessages = true;
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
@@ -107,11 +107,11 @@ export class GroupQueue {
       if (state.idleWaiting) {
         this.closeStdin(groupJid);
       }
-      logger.debug({ groupJid, taskId }, 'Container active, task queued');
+      logger.debug({ groupJid, taskId }, 'Host agent active, task queued');
       return;
     }
 
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+    if (this.activeCount >= MAX_CONCURRENT_AGENTS) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
@@ -132,12 +132,12 @@ export class GroupQueue {
   registerProcess(
     groupJid: string,
     proc: ChildProcess,
-    containerName: string,
+    processName: string,
     groupFolder?: string,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
-    state.containerName = containerName;
+    state.processName = processName;
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
@@ -159,9 +159,10 @@ export class GroupQueue {
    */
   sendMessage(groupJid: string, text: string): boolean {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
+    if (!state.active || !state.groupFolder || state.isTaskContainer) {
       return false;
-    state.idleWaiting = false; // Agent is about to receive work, no longer idle
+    }
+    state.idleWaiting = false;
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
@@ -206,7 +207,7 @@ export class GroupQueue {
 
     logger.debug(
       { groupJid, reason, activeCount: this.activeCount },
-      'Starting container for group',
+      'Starting host agent for group',
     );
 
     try {
@@ -224,7 +225,7 @@ export class GroupQueue {
     } finally {
       state.active = false;
       state.process = null;
-      state.containerName = null;
+      state.processName = null;
       state.groupFolder = null;
       this.activeCount--;
       this.drainGroup(groupJid);
@@ -253,7 +254,7 @@ export class GroupQueue {
       state.isTaskContainer = false;
       state.runningTaskId = null;
       state.process = null;
-      state.containerName = null;
+      state.processName = null;
       state.groupFolder = null;
       this.activeCount--;
       this.drainGroup(groupJid);
@@ -318,7 +319,7 @@ export class GroupQueue {
   private drainWaiting(): void {
     while (
       this.waitingGroups.length > 0 &&
-      this.activeCount < MAX_CONCURRENT_CONTAINERS
+      this.activeCount < MAX_CONCURRENT_AGENTS
     ) {
       const nextJid = this.waitingGroups.shift()!;
       const state = this.getGroup(nextJid);
@@ -350,16 +351,16 @@ export class GroupQueue {
     // Count active containers but don't kill them — they'll finish on their own
     // via idle timeout or container timeout. The --rm flag cleans them up on exit.
     // This prevents WhatsApp reconnection restarts from killing working agents.
-    const activeContainers: string[] = [];
-    for (const [jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
+    const activeProcesses: string[] = [];
+    for (const [, state] of this.groups) {
+      if (state.process && !state.process.killed && state.processName) {
+        activeProcesses.push(state.processName);
       }
     }
 
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { activeCount: this.activeCount, detachedProcesses: activeProcesses },
+      'GroupQueue shutting down (host agents detached, not killed)',
     );
   }
 }

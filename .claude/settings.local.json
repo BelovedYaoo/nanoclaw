@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(get-qodo-rules)",
+      "Bash(npm run:*)",
+      "Bash(netstat -ano)",
+      "Bash(node:*)",
+      "Bash(npm install:*)"
+    ]
+  }
+}

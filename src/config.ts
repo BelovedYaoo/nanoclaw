@@ -3,10 +3,17 @@ import path from 'path';
 
 import { readEnvFile } from './env.js';
 
-// Read config values from .env (falls back to process.env).
-// Secrets (API keys, tokens) are NOT read here — they are loaded only
-// by the credential proxy (credential-proxy.ts), never exposed to containers.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+// 从 .env 读取基础配置（若进程环境变量存在则优先使用）。
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ADMIN_ENABLED',
+  'ADMIN_BIND_HOST',
+  'ADMIN_PORT',
+  'ADMIN_PASSWORD',
+  'ADMIN_SESSION_SECRET',
+  'ADMIN_SESSION_TTL_MS',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -20,13 +27,6 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
-// Mount security: allowlist stored OUTSIDE project root, never mounted into containers
-export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
-  'mount-allowlist.json',
-);
 export const SENDER_ALLOWLIST_PATH = path.join(
   HOME_DIR,
   '.config',
@@ -37,25 +37,11 @@ export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
-export const CONTAINER_IMAGE =
-  process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(
-  process.env.CONTAINER_TIMEOUT || '1800000',
-  10,
-);
-export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
-  process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
-  10,
-); // 10MB default
-export const CREDENTIAL_PROXY_PORT = parseInt(
-  process.env.CREDENTIAL_PROXY_PORT || '3001',
-  10,
-);
 export const IPC_POLL_INTERVAL = 1000;
-export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
-export const MAX_CONCURRENT_CONTAINERS = Math.max(
+export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10);
+export const MAX_CONCURRENT_AGENTS = Math.max(
   1,
-  parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
+  parseInt(process.env.MAX_CONCURRENT_AGENTS || '5', 10) || 5,
 );
 
 function escapeRegex(str: string): string {
@@ -71,3 +57,22 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+export const ADMIN_ENABLED =
+  (process.env.ADMIN_ENABLED || envConfig.ADMIN_ENABLED || 'false') === 'true';
+export const ADMIN_BIND_HOST =
+  process.env.ADMIN_BIND_HOST || envConfig.ADMIN_BIND_HOST || '127.0.0.1';
+export const ADMIN_PORT = parseInt(
+  process.env.ADMIN_PORT || envConfig.ADMIN_PORT || '3210',
+  10,
+);
+export const ADMIN_PASSWORD =
+  process.env.ADMIN_PASSWORD || envConfig.ADMIN_PASSWORD || '';
+export const ADMIN_SESSION_SECRET =
+  process.env.ADMIN_SESSION_SECRET ||
+  envConfig.ADMIN_SESSION_SECRET ||
+  'nanoclaw-admin-session-secret';
+export const ADMIN_SESSION_TTL_MS = parseInt(
+  process.env.ADMIN_SESSION_TTL_MS || envConfig.ADMIN_SESSION_TTL_MS || '43200000',
+  10,
+);

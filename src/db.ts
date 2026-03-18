@@ -2,154 +2,205 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { ASSISTANT_NAME, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  ConversationId,
+  MessageTarget,
   NewMessage,
-  RegisteredGroup,
+  RegisteredConversation,
   ScheduledTask,
-  TaskRunLog,
 } from './types.js';
+
+const DB_SCHEMA_VERSION = '3';
 
 let db: Database.Database;
 
+function upsertConversation(params: {
+  target: MessageTarget;
+  name: string;
+  timestamp: string;
+}): ConversationId {
+  const conversationId = params.target.conversationId;
+
+  db.prepare(
+    `
+    INSERT INTO conversations (
+      id,
+      channel,
+      external_id,
+      peer_kind,
+      account_id,
+      legacy_chat_jid,
+      display_name,
+      is_group,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      channel = excluded.channel,
+      external_id = excluded.external_id,
+      peer_kind = excluded.peer_kind,
+      account_id = COALESCE(excluded.account_id, conversations.account_id),
+      legacy_chat_jid = excluded.legacy_chat_jid,
+      display_name = excluded.display_name,
+      is_group = excluded.is_group,
+      updated_at = CASE
+        WHEN excluded.updated_at > conversations.updated_at THEN excluded.updated_at
+        ELSE conversations.updated_at
+      END
+  `,
+  ).run(
+    conversationId,
+    params.target.channel,
+    params.target.externalId,
+    params.target.peerKind,
+    params.target.accountId ?? null,
+    params.target.chatJid,
+    params.name,
+    params.target.isGroup ? 1 : 0,
+    params.timestamp,
+    params.timestamp,
+  );
+
+  return conversationId;
+}
+
 function createSchema(database: Database.Database): void {
   database.exec(`
-    CREATE TABLE IF NOT EXISTS chats (
+    CREATE TABLE chats (
       jid TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL UNIQUE,
       name TEXT,
       last_message_time TEXT,
-      channel TEXT,
-      is_group INTEGER DEFAULT 0
+      channel TEXT NOT NULL,
+      is_group INTEGER DEFAULT 0,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id)
     );
-    CREATE TABLE IF NOT EXISTS messages (
+    CREATE INDEX idx_chats_conversation_id ON chats(conversation_id);
+
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY,
+      channel TEXT NOT NULL,
+      external_id TEXT NOT NULL,
+      peer_kind TEXT NOT NULL,
+      account_id TEXT,
+      legacy_chat_jid TEXT UNIQUE,
+      display_name TEXT NOT NULL,
+      is_group INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_conversations_channel ON conversations(channel);
+    CREATE INDEX idx_conversations_legacy_chat_jid ON conversations(legacy_chat_jid);
+
+    CREATE TABLE messages (
       id TEXT,
-      chat_jid TEXT,
+      conversation_id TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
       sender TEXT,
       sender_name TEXT,
       content TEXT,
       timestamp TEXT,
+      message_type TEXT,
       is_from_me INTEGER,
       is_bot_message INTEGER DEFAULT 0,
-      PRIMARY KEY (id, chat_jid),
+      mentioned_bot INTEGER DEFAULT 0,
+      trigger_matched INTEGER DEFAULT 0,
+      trigger_source TEXT DEFAULT 'none',
+      PRIMARY KEY (id, conversation_id),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
-    CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
+    CREATE INDEX idx_timestamp ON messages(timestamp);
+    CREATE INDEX idx_messages_chat_jid ON messages(chat_jid);
 
-    CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    CREATE TABLE scheduled_tasks (
       id TEXT PRIMARY KEY,
       group_folder TEXT NOT NULL,
       chat_jid TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
       prompt TEXT NOT NULL,
       schedule_type TEXT NOT NULL,
       schedule_value TEXT NOT NULL,
+      context_mode TEXT DEFAULT 'isolated',
       next_run TEXT,
       last_run TEXT,
       last_result TEXT,
       status TEXT DEFAULT 'active',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+      FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
-    CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
-    CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
+    CREATE INDEX idx_next_run ON scheduled_tasks(next_run);
+    CREATE INDEX idx_status ON scheduled_tasks(status);
 
-    CREATE TABLE IF NOT EXISTS task_run_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id TEXT NOT NULL,
-      run_at TEXT NOT NULL,
-      duration_ms INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      result TEXT,
-      error TEXT,
-      FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
-
-    CREATE TABLE IF NOT EXISTS router_state (
+    CREATE TABLE router_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS sessions (
+    CREATE TABLE sessions (
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS registered_groups (
+    CREATE TABLE registered_groups (
       jid TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
       folder TEXT NOT NULL UNIQUE,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
-      container_config TEXT,
-      requires_trigger INTEGER DEFAULT 1
+      requires_trigger INTEGER DEFAULT 1,
+      is_main INTEGER DEFAULT 0,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+    );
+    CREATE TABLE registrations (
+      conversation_id TEXT PRIMARY KEY,
+      jid TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      folder TEXT NOT NULL UNIQUE,
+      trigger_pattern TEXT NOT NULL,
+      added_at TEXT NOT NULL,
+      requires_trigger INTEGER DEFAULT 1,
+      is_main INTEGER DEFAULT 0,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id)
     );
   `);
 
-  // Add context_mode column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
-    );
-  } catch {
-    /* column already exists */
-  }
-
-  // Add is_bot_message column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE messages ADD COLUMN is_bot_message INTEGER DEFAULT 0`,
-    );
-    // Backfill: mark existing bot messages that used the content prefix pattern
-    database
-      .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
-      .run(`${ASSISTANT_NAME}:%`);
-  } catch {
-    /* column already exists */
-  }
-
-  // Add is_main column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE registered_groups ADD COLUMN is_main INTEGER DEFAULT 0`,
-    );
-    // Backfill: existing rows with folder = 'main' are the main group
-    database.exec(
-      `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
-    );
-  } catch {
-    /* column already exists */
-  }
-
-  // Add channel and is_group columns if they don't exist (migration for existing DBs)
-  try {
-    database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
-    database.exec(`ALTER TABLE chats ADD COLUMN is_group INTEGER DEFAULT 0`);
-    // Backfill from JID patterns
-    database.exec(
-      `UPDATE chats SET channel = 'whatsapp', is_group = 1 WHERE jid LIKE '%@g.us'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'whatsapp', is_group = 0 WHERE jid LIKE '%@s.whatsapp.net'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
-    );
-  } catch {
-    /* columns already exist */
-  }
+  database
+    .prepare(`INSERT OR REPLACE INTO router_state (key, value) VALUES ('schema_version', ?)`)
+    .run(DB_SCHEMA_VERSION);
 }
 
 export function initDatabase(): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-  db = new Database(dbPath);
-  createSchema(db);
+  let shouldRecreate = !fs.existsSync(dbPath);
 
-  // Migrate from JSON files if they exist
-  migrateJsonState();
+  if (!shouldRecreate) {
+    const existingDb = new Database(dbPath, { readonly: true });
+    try {
+      const state = existingDb
+        .prepare(`SELECT value FROM router_state WHERE key = 'schema_version'`)
+        .get() as { value: string } | undefined;
+      shouldRecreate = state?.value !== DB_SCHEMA_VERSION;
+    } catch {
+      shouldRecreate = true;
+    } finally {
+      existingDb.close();
+    }
+  }
+
+  if (shouldRecreate && fs.existsSync(dbPath)) {
+    fs.rmSync(dbPath, { force: true });
+  }
+
+  db = new Database(dbPath);
+  if (shouldRecreate) {
+    createSchema(db);
+  }
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -163,39 +214,36 @@ export function _initTestDatabase(): void {
  * Used for all chats to enable group discovery without storing sensitive content.
  */
 export function storeChatMetadata(
-  chatJid: string,
+  target: MessageTarget,
   timestamp: string,
   name?: string,
-  channel?: string,
-  isGroup?: boolean,
 ): void {
-  const ch = channel ?? null;
-  const group = isGroup === undefined ? null : isGroup ? 1 : 0;
+  const resolvedName = name || target.chatJid;
+  const conversationId = upsertConversation({
+    target,
+    name: resolvedName,
+    timestamp,
+  });
 
-  if (name) {
-    // Update with name, preserving existing timestamp if newer
-    db.prepare(
-      `
-      INSERT INTO chats (jid, name, last_message_time, channel, is_group) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(jid) DO UPDATE SET
-        name = excluded.name,
-        last_message_time = MAX(last_message_time, excluded.last_message_time),
-        channel = COALESCE(excluded.channel, channel),
-        is_group = COALESCE(excluded.is_group, is_group)
-    `,
-    ).run(chatJid, name, timestamp, ch, group);
-  } else {
-    // Update timestamp only, preserve existing name if any
-    db.prepare(
-      `
-      INSERT INTO chats (jid, name, last_message_time, channel, is_group) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(jid) DO UPDATE SET
-        last_message_time = MAX(last_message_time, excluded.last_message_time),
-        channel = COALESCE(excluded.channel, channel),
-        is_group = COALESCE(excluded.is_group, is_group)
-    `,
-    ).run(chatJid, chatJid, timestamp, ch, group);
-  }
+  db.prepare(
+    `
+    INSERT INTO chats (jid, conversation_id, name, last_message_time, channel, is_group)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(jid) DO UPDATE SET
+      conversation_id = excluded.conversation_id,
+      name = excluded.name,
+      last_message_time = MAX(chats.last_message_time, excluded.last_message_time),
+      channel = excluded.channel,
+      is_group = excluded.is_group
+  `,
+  ).run(
+    target.chatJid,
+    conversationId,
+    resolvedName,
+    timestamp,
+    target.channel,
+    target.isGroup ? 1 : 0,
+  );
 }
 
 /**
@@ -203,17 +251,35 @@ export function storeChatMetadata(
  * New chats get the current time as their initial timestamp.
  * Used during group metadata sync.
  */
-export function updateChatName(chatJid: string, name: string): void {
+export function updateChatName(target: MessageTarget, name: string): void {
+  const now = new Date().toISOString();
+  const conversationId = upsertConversation({
+    target,
+    name,
+    timestamp: now,
+  });
+
   db.prepare(
     `
-    INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-    ON CONFLICT(jid) DO UPDATE SET name = excluded.name
+    INSERT INTO chats (jid, conversation_id, name, last_message_time, channel, is_group)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(jid) DO UPDATE SET
+      conversation_id = excluded.conversation_id,
+      name = excluded.name
   `,
-  ).run(chatJid, name, new Date().toISOString());
+  ).run(
+    target.chatJid,
+    conversationId,
+    name,
+    now,
+    target.channel,
+    target.isGroup ? 1 : 0,
+  );
 }
 
 export interface ChatInfo {
   jid: string;
+  conversation_id: string;
   name: string;
   last_message_time: string;
   channel: string;
@@ -227,12 +293,24 @@ export function getAllChats(): ChatInfo[] {
   return db
     .prepare(
       `
-    SELECT jid, name, last_message_time, channel, is_group
+    SELECT jid, conversation_id, name, last_message_time, channel, is_group
     FROM chats
     ORDER BY last_message_time DESC
   `,
     )
     .all() as ChatInfo[];
+}
+
+export function getChatByJid(chatJid: string): ChatInfo | undefined {
+  return db
+    .prepare(
+      `
+    SELECT jid, conversation_id, name, last_message_time, channel, is_group
+    FROM chats
+    WHERE jid = ?
+  `,
+    )
+    .get(chatJid) as ChatInfo | undefined;
 }
 
 /**
@@ -251,54 +329,135 @@ export function getLastGroupSync(): string | null {
  */
 export function setLastGroupSync(): void {
   const now = new Date().toISOString();
+  const conversationId = upsertConversation({
+    target: {
+      conversationId: 'conv:__group_sync__',
+      chatJid: '__group_sync__',
+      channel: 'system',
+      externalId: '__group_sync__',
+      peerKind: 'system',
+      isGroup: false,
+    },
+    name: '__group_sync__',
+    timestamp: now,
+  });
   db.prepare(
-    `INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES ('__group_sync__', '__group_sync__', ?)`,
-  ).run(now);
+    `
+    INSERT OR REPLACE INTO chats (jid, conversation_id, name, last_message_time, channel, is_group)
+    VALUES ('__group_sync__', ?, '__group_sync__', ?, 'system', 0)
+  `,
+  ).run(conversationId, now);
 }
 
 /**
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
-export function storeMessage(msg: NewMessage): void {
+export function storeMessage(target: MessageTarget, msg: NewMessage): void {
+  const conversationId =
+    msg.conversation_id ||
+    upsertConversation({
+      target,
+      name: msg.sender_name || target.chatJid,
+      timestamp: msg.timestamp,
+    });
+
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `
+    INSERT OR REPLACE INTO messages (
+      id,
+      conversation_id,
+      chat_jid,
+      sender,
+      sender_name,
+      content,
+      timestamp,
+      message_type,
+      is_from_me,
+      is_bot_message,
+      mentioned_bot,
+      trigger_matched,
+      trigger_source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
   ).run(
     msg.id,
+    conversationId,
     msg.chat_jid,
     msg.sender,
     msg.sender_name,
     msg.content,
     msg.timestamp,
+    msg.message_type ?? null,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.mentioned_bot ? 1 : 0,
+    msg.trigger_matched ? 1 : 0,
+    msg.trigger_source ?? 'none',
   );
 }
 
 /**
  * Store a message directly.
  */
-export function storeMessageDirect(msg: {
-  id: string;
-  chat_jid: string;
-  sender: string;
-  sender_name: string;
-  content: string;
-  timestamp: string;
-  is_from_me: boolean;
-  is_bot_message?: boolean;
-}): void {
+export function storeMessageDirect(
+  target: MessageTarget,
+  msg: {
+    id: string;
+    chat_jid: string;
+    conversation_id?: ConversationId;
+    sender: string;
+    sender_name: string;
+    content: string;
+    timestamp: string;
+    message_type?: string;
+    is_from_me: boolean;
+    is_bot_message?: boolean;
+    mentioned_bot?: boolean;
+    trigger_matched?: boolean;
+    trigger_source?: 'mention' | 'text' | 'system' | 'none';
+  },
+): void {
+  const conversationId =
+    msg.conversation_id ||
+    upsertConversation({
+      target,
+      name: msg.sender_name || target.chatJid,
+      timestamp: msg.timestamp,
+    });
+
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `
+    INSERT OR REPLACE INTO messages (
+      id,
+      conversation_id,
+      chat_jid,
+      sender,
+      sender_name,
+      content,
+      timestamp,
+      message_type,
+      is_from_me,
+      is_bot_message,
+      mentioned_bot,
+      trigger_matched,
+      trigger_source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
   ).run(
     msg.id,
+    conversationId,
     msg.chat_jid,
     msg.sender,
     msg.sender_name,
     msg.content,
     msg.timestamp,
+    msg.message_type ?? null,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.mentioned_bot ? 1 : 0,
+    msg.trigger_matched ? 1 : 0,
+    msg.trigger_source ?? 'none',
   );
 }
 
@@ -316,7 +475,7 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, conversation_id, chat_jid, sender, sender_name, content, timestamp, message_type, is_from_me, is_bot_message, mentioned_bot, trigger_matched, trigger_source
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -349,7 +508,7 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, conversation_id, chat_jid, sender, sender_name, content, timestamp, message_type, is_from_me, is_bot_message, mentioned_bot, trigger_matched, trigger_source
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -364,17 +523,34 @@ export function getMessagesSince(
 }
 
 export function createTask(
-  task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
+  task: Omit<ScheduledTask, 'last_run' | 'last_result'> & {
+    conversation_id: ConversationId;
+  },
 ): void {
+  const conversationId = task.conversation_id;
+
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (
+      id,
+      group_folder,
+      chat_jid,
+      conversation_id,
+      prompt,
+      schedule_type,
+      schedule_value,
+      context_mode,
+      next_run,
+      status,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
     task.group_folder,
     task.chat_jid,
+    conversationId,
     task.prompt,
     task.schedule_type,
     task.schedule_value,
@@ -452,8 +628,8 @@ export function deleteTask(id: string): void {
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
 }
 
-export function getDueTasks(): ScheduledTask[] {
-  const now = new Date().toISOString();
+export function getDueTasks(nowIso?: string): ScheduledTask[] {
+  const now = nowIso || new Date().toISOString();
   return db
     .prepare(
       `
@@ -463,6 +639,19 @@ export function getDueTasks(): ScheduledTask[] {
   `,
     )
     .all(now) as ScheduledTask[];
+}
+
+export function getNextScheduledTask(): ScheduledTask | undefined {
+  return db
+    .prepare(
+      `
+    SELECT * FROM scheduled_tasks
+    WHERE status = 'active' AND next_run IS NOT NULL
+    ORDER BY next_run
+    LIMIT 1
+  `,
+    )
+    .get() as ScheduledTask | undefined;
 }
 
 export function updateTaskAfterRun(
@@ -478,22 +667,6 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
-}
-
-export function logTaskRun(log: TaskRunLog): void {
-  db.prepare(
-    `
-    INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `,
-  ).run(
-    log.task_id,
-    log.run_at,
-    log.duration_ms,
-    log.status,
-    log.result,
-    log.error,
-  );
 }
 
 // --- Router state accessors ---
@@ -541,17 +714,17 @@ export function getAllSessions(): Record<string, string> {
 
 export function getRegisteredGroup(
   jid: string,
-): (RegisteredGroup & { jid: string }) | undefined {
+): (RegisteredConversation & { jid: string }) | undefined {
   const row = db
     .prepare('SELECT * FROM registered_groups WHERE jid = ?')
     .get(jid) as
     | {
         jid: string;
+        conversation_id: string;
         name: string;
         folder: string;
         trigger_pattern: string;
         added_at: string;
-        container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
       }
@@ -566,50 +739,133 @@ export function getRegisteredGroup(
   }
   return {
     jid: row.jid,
+    conversationId: row.conversation_id,
     name: row.name,
     folder: row.folder,
     trigger: row.trigger_pattern,
     added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
   };
 }
 
-export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+export function setRegisteredGroup(
+  jid: string,
+  group: RegisteredConversation,
+  target: MessageTarget,
+): void {
   if (!isValidGroupFolder(group.folder)) {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
+
+  const conversationId =
+    group.conversationId ||
+    upsertConversation({
+      target,
+      name: group.name,
+      timestamp: group.added_at,
+    });
+
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `
+    INSERT OR REPLACE INTO registered_groups (
+      jid,
+      conversation_id,
+      name,
+      folder,
+      trigger_pattern,
+      added_at,
+      requires_trigger,
+      is_main
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `,
   ).run(
+    jid,
+    conversationId,
+    group.name,
+    group.folder,
+    group.trigger,
+    group.added_at,
+    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.isMain ? 1 : 0,
+  );
+
+  db.prepare(
+    `
+    INSERT OR REPLACE INTO registrations (
+      conversation_id,
+      jid,
+      name,
+      folder,
+      trigger_pattern,
+      added_at,
+      requires_trigger,
+      is_main
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `,
+  ).run(
+    conversationId,
     jid,
     group.name,
     group.folder,
     group.trigger,
     group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
   );
 }
 
-export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
+export function getRegisteredGroupByFolder(
+  folder: string,
+): (RegisteredConversation & { jid: string }) | undefined {
+  const row = db
+    .prepare('SELECT * FROM registered_groups WHERE folder = ?')
+    .get(folder) as
+    | {
+        jid: string;
+        conversation_id: string;
+        name: string;
+        folder: string;
+        trigger_pattern: string;
+        added_at: string;
+        requires_trigger: number | null;
+        is_main: number | null;
+      }
+    | undefined;
+  if (!row) return undefined;
+  if (!isValidGroupFolder(row.folder)) {
+    logger.warn(
+      { jid: row.jid, folder: row.folder },
+      'Skipping registered group with invalid folder',
+    );
+    return undefined;
+  }
+  return {
+    jid: row.jid,
+    conversationId: row.conversation_id,
+    name: row.name,
+    folder: row.folder,
+    trigger: row.trigger_pattern,
+    added_at: row.added_at,
+    requiresTrigger:
+      row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+    isMain: row.is_main === 1 ? true : undefined,
+  };
+}
+
+export function getAllRegisteredGroups(): Record<string, RegisteredConversation> {
   const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
     jid: string;
+    conversation_id: string;
     name: string;
     folder: string;
     trigger_pattern: string;
     added_at: string;
-    container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
   }>;
-  const result: Record<string, RegisteredGroup> = {};
+  const result: Record<string, RegisteredConversation> = {};
   for (const row of rows) {
     if (!isValidGroupFolder(row.folder)) {
       logger.warn(
@@ -619,13 +875,11 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       continue;
     }
     result[row.jid] = {
+      conversationId: row.conversation_id,
       name: row.name,
       folder: row.folder,
       trigger: row.trigger_pattern,
       added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,
@@ -634,64 +888,3 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   return result;
 }
 
-// --- JSON migration ---
-
-function migrateJsonState(): void {
-  const migrateFile = (filename: string) => {
-    const filePath = path.join(DATA_DIR, filename);
-    if (!fs.existsSync(filePath)) return null;
-    try {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      fs.renameSync(filePath, `${filePath}.migrated`);
-      return data;
-    } catch {
-      return null;
-    }
-  };
-
-  // Migrate router_state.json
-  const routerState = migrateFile('router_state.json') as {
-    last_timestamp?: string;
-    last_agent_timestamp?: Record<string, string>;
-  } | null;
-  if (routerState) {
-    if (routerState.last_timestamp) {
-      setRouterState('last_timestamp', routerState.last_timestamp);
-    }
-    if (routerState.last_agent_timestamp) {
-      setRouterState(
-        'last_agent_timestamp',
-        JSON.stringify(routerState.last_agent_timestamp),
-      );
-    }
-  }
-
-  // Migrate sessions.json
-  const sessions = migrateFile('sessions.json') as Record<
-    string,
-    string
-  > | null;
-  if (sessions) {
-    for (const [folder, sessionId] of Object.entries(sessions)) {
-      setSession(folder, sessionId);
-    }
-  }
-
-  // Migrate registered_groups.json
-  const groups = migrateFile('registered_groups.json') as Record<
-    string,
-    RegisteredGroup
-  > | null;
-  if (groups) {
-    for (const [jid, group] of Object.entries(groups)) {
-      try {
-        setRegisteredGroup(jid, group);
-      } catch (err) {
-        logger.warn(
-          { jid, folder: group.folder, err },
-          'Skipping migrated registered group with invalid folder',
-        );
-      }
-    }
-  }
-}

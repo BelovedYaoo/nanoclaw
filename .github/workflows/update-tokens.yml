@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['src/**', 'container/**', 'launchd/**', 'CLAUDE.md']
+    paths: ['src/**', 'launchd/**', 'CLAUDE.md']
 
 jobs:
   update-tokens:
@@ -27,8 +27,7 @@ jobs:
       - uses: ./repo-tokens
         id: tokens
         with:
-          include: 'src/**/*.ts container/agent-runner/src/**/*.ts container/Dockerfile container/build.sh launchd/com.nanoclaw.plist CLAUDE.md'
-          exclude: 'src/**/*.test.ts'
+          include: 'src/**/*.ts launchd/com.nanoclaw.plist CLAUDE.md'
           badge-path: 'repo-tokens/badge.svg'
 
       - name: Commit if changed

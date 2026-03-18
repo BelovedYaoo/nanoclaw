@@ -34,7 +34,7 @@ This adds:
 - `src/session-commands.ts` (extract and authorize session commands)
 - `src/session-commands.test.ts` (unit tests for command parsing and auth)
 - Session command interception in `src/index.ts` (both `processGroupMessages` and `startMessageLoop`)
-- Slash command handling in `container/agent-runner/src/index.ts`
+- Slash command handling in `src/host-runner/index.ts`
 
 ### Validate
 
@@ -43,10 +43,9 @@ npm test
 npm run build
 ```
 
-### Rebuild container
+### Rebuild host agent
 
 ```bash
-./container/build.sh
 ```
 
 ### Restart service
@@ -71,18 +70,18 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 4. From a **non-main group** as a non-admin user, send: `@<assistant> /compact`
 5. Verify:
    - The bot responds with "Session commands require admin access."
-   - No compaction occurs, no container is spawned for the command
+   - No compaction occurs, no host agent is spawned for the command
 6. From a **non-main group** as the admin (device owner / `is_from_me`), send: `@<assistant> /compact`
 7. Verify:
    - Compaction proceeds normally (same behavior as main group)
-8. While an **active container** is running for the main group, send `/compact`
+8. While an **active host agent** is running for the main group, send `/compact`
 9. Verify:
-   - The active container is signaled to close (authorized senders only — untrusted senders cannot kill in-flight work)
-   - Compaction proceeds via a new container once the active one exits
+   - The active host agent is signaled to close (authorized senders only — untrusted senders cannot kill in-flight work)
+   - Compaction proceeds via a new host agent once the active one exits
    - The command is not dropped (no cursor race)
 10. Send a normal message, then `/compact`, then another normal message in quick succession (same polling batch):
 11. Verify:
-    - Pre-compact messages are sent to the agent first (check container logs for two `runAgent` calls)
+    - Pre-compact messages are sent to the agent first (check host agent logs for two `runAgent` calls)
     - Compaction proceeds after pre-compact messages are processed
     - Messages **after** `/compact` in the batch are preserved (cursor advances to `/compact`'s timestamp only) and processed on the next poll cycle
 12. From a **non-main group** as a non-admin user, send `@<assistant> /compact`:
@@ -90,7 +89,7 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
     - Denial message is sent ("Session commands require admin access.")
     - The `/compact` is consumed (cursor advanced) — it does NOT replay on future polls
     - Other messages in the same batch are also consumed (cursor is a high-water mark — this is an accepted tradeoff for the narrow edge case of denied `/compact` + other messages in the same polling interval)
-    - No container is killed or interrupted
+    - No host agent is killed or interrupted
 14. From a **non-main group** (with `requiresTrigger` enabled) as a non-admin user, send bare `/compact` (no trigger prefix):
 15. Verify:
     - No denial message is sent (trigger policy prevents untrusted bot responses)
@@ -106,7 +105,6 @@ cd /tmp/nanoclaw-test
 claude  # then run /add-compact
 npm run build
 npm test
-./container/build.sh
 # Manual: send /compact from main group, verify compaction + continuation
 # Manual: send @<assistant> /compact from non-main as non-admin, verify denial
 # Manual: send @<assistant> /compact from non-main as admin, verify allowed
@@ -126,7 +124,7 @@ npm test
 - No automatic compaction threshold (add separately if desired)
 - No `/clear` command (separate skill, separate semantics — `/clear` is a destructive reset)
 - No cross-group compaction (each group's session is isolated)
-- No changes to the container image, Dockerfile, or build script
+- No changes to the host agent image, Dockerfile, or build script
 
 ## Troubleshooting
 
